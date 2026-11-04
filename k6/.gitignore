@@ -1,0 +1,9 @@
+*.zip
+perf.env
+*.env
+!perf.env.example
+qat/results/*
+!qat/results/.gitkeep
+qat/report/*
+pre/results/*
+!pre/results/.gitkeep
