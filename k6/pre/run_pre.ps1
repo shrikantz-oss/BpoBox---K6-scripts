@@ -10,6 +10,7 @@
 
 .EXAMPLE
   .\pre\run_pre.ps1 dry                           # 10 calls in one zip: login, IDs, upload and tracking work end to end
+  .\pre\run_pre.ps1 dry -CallsPerZip 1            # same 10 calls as 10 single-call zips: every call dated today
   .\pre\run_pre.ps1 check                         # 100 calls: login, group, and Lambda-speed check
   .\pre\run_pre.ps1 burst -Sizes 100,200,500,1000 # bursts sent all at once (zips of 100)
   .\pre\run_pre.ps1 step                          # 200 -> 300 -> 450 -> 667 calls/min, stops at the first failing step
@@ -22,6 +23,9 @@ param(
     [string]$Sizes = '100,200,500,1000',
     [int]$PerHour = 40000,
     [int]$Minutes = 60,
+    # Calls per zip for dry/burst. The backend dates each call by its position in its zip (1st = today,
+    # 2nd = yesterday, ...), so 1 puts every call on today's date. Keep zips at once <= 10 (DB pool limit).
+    [int]$CallsPerZip = 0,
     [string]$EnvFile = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -79,12 +83,23 @@ if ($Test -notin @('dry', 'check')) {
 
 # ── Command for the chosen test (no --yes: the window asks for confirmation before sending load) ──
 $envArg = "--env-file '$EnvFile'"
+if ($CallsPerZip -and ($CallsPerZip -lt 1 -or $CallsPerZip -gt 500)) { Fail "-CallsPerZip must be 1..500 (got $CallsPerZip)" }
+if ($CallsPerZip -and $Test -notin @('dry', 'burst')) { Fail "-CallsPerZip applies to dry and burst only" }
+$cpzArg = $(if ($CallsPerZip) { "--calls-per-zip $CallsPerZip" } else { '' })
 switch ($Test) {
-    'dry'    { $py = "run_burst.py --sizes 10 --calls-per-zip 10 $envArg" }
+    'dry'    {
+        $dryCpz = $(if ($CallsPerZip) { $CallsPerZip } else { 10 })
+        $py = "run_burst.py --sizes 10 --calls-per-zip $dryCpz $envArg"
+    }
     'check'  { $py = "run_e2e.py smoke $envArg" }
     'burst'  {
         if ($Sizes -notmatch '^\d+(,\d+)*$') { Fail "-Sizes must look like 100,200,500 (got '$Sizes')" }
-        $py = "run_burst.py --sizes $Sizes $envArg"
+        if ($CallsPerZip) {
+            # Many zips unpacking at once exhausted QAT's DB pool (40 zips failed, <= 10 passed)
+            $maxZips = ($Sizes -split ',' | ForEach-Object { [math]::Ceiling([int]$_ / $CallsPerZip) } | Measure-Object -Maximum).Maximum
+            if ($maxZips -gt 10) { Fail "-CallsPerZip $CallsPerZip makes $maxZips zips at once for the largest burst; keep it to 10 or fewer." }
+        }
+        $py = "run_burst.py --sizes $Sizes $cpzArg $envArg"
     }
     'step'   { $py = "run_e2e.py step $envArg" }
     'target' { $py = "run_e2e.py target --per-hour $PerHour --minutes $Minutes $envArg" }

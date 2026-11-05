@@ -158,6 +158,46 @@ Notes:
   Don't log in as the perf user elsewhere: the single-session policy would end the run.
 - **Server-side metrics** (CPU, DB, Lambda, SQS) aren't collected. Pull them from CloudWatch for the run window.
 
+## Burst sequences (`run_burst.py`)
+
+```
+python -I run_burst.py --sizes 100,200,500,1000 --yes             # one run per size
+python -I run_burst.py --sizes 100,200,500,1000 --repeat 3 --yes  # typical value + range per size
+python -I run_burst.py --sizes 1000 --stagger-s 30 --yes          # NON-standard: zips 30 s apart
+```
+
+- **Per-call verification** runs after each completed burst: the run's calls are listed from QAT's call list and
+  compared with the report (`<run>_verify.md`). QAT doesn't keep uploaded file names and the zip upload back-dates
+  each call's `created_at` by (index % 60) days, so the whole test group is read once and a run's calls are the uploads
+  (`UPLOAD-…`) whose time of day falls in the run's window (earlier runs excluded by display number). Don't upload
+  into that group during a test.
+  `--no-verify` skips it; `verify_run.py <result.json> [more.json …]` checks older runs with one login.
+  If QAT returns times without a zone, set `VERIFY_TZ_OFFSET_MIN` (e.g. 330 for IST) in `perf.env`.
+- **Progress is polled every 10 s** (`BURST_POLL_INTERVAL_S`); the safety stop still fires after about a minute without answers.
+- **Leftover calls don't count as progress.** At the start every run lists the group's unfinished calls (Call Review
+  "under review" tab). When the group looks nearly done, the run counts only its own unfinished calls, so it is not
+  declared finished while its own calls are still open. If some of its calls fail in the pipeline, it ends with
+  "all calls finished; N failed in the pipeline" instead of waiting for them. This own-call check reads the whole
+  "under review" list, so it runs only once all calls are uploaded, and then on every 2nd poll (`OWN_CHECK_EVERY`).
+
+## Ramp / step tests (`run_e2e.py step`)
+
+```
+python -I run_e2e.py step --step-rates 100,200,500,1000 --step-minutes 5 --yes
+```
+
+- A step **fails** (uploads stop) when 2 zips are rejected, the API falls more than 10 zips behind in unpacking, or QAT stops answering.
+- After each step it prints and records (`steps` in the result file) calls sent, created and analysed per minute, and
+  whether **analysis kept up**: this run's own analysis backlog grew by no more than one minute of that step's calls.
+  Set `STEP_STOP_ON_ANALYSIS=true` in `perf.env` to also stop the test at the first step where analysis falls behind.
+- After any `run_e2e.py` scenario that finishes, the **per-call check runs automatically** (as for bursts); `--no-verify` skips it.
+- **Each result records its setup** (git commit, k6 version, zips, poll interval, AI mode, load-generator host) under `setup`.
+- **`burst_summary_<ts>.md`** ends every sequence: verdict per size (pass / pass with slow website / fail), typical time and
+  range, per-call verification, and the change against earlier runs with the same size, zip packing and upload pattern.
+  Rebuild with `python -I burst_summary.py qat/results/e2e_burst*_<date>_*.json -o <file>`.
+- **`--stagger-s`** starts zip k after k × N seconds. It is gentler on the API, so its times are better but are not the
+  standard "all at once" test: those runs are named `burst<N>stg<S>` and kept out of the standard comparisons and headline figures.
+
 ## What to watch on the server side during the run
 - **API container CPU/memory and event-loop latency.** All 5000 files are processed inside the API process (not Celery):
   mutagen duration parsing runs synchronously on the event loop, and every file runs a `max(display_id)` query.

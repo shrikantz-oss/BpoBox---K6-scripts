@@ -68,7 +68,9 @@ def _by(results, pred):
 
 def _burst(r, cpz_test, size=None):
     b = (r.get("plan") or {}).get("burst")
-    return bool(b) and cpz_test(r.get("calls_per_zip")) and (size is None or b["calls"] == size)
+    # Staggered uploads are a gentler, non-standard test: never mixed into the standard burst rows
+    return (bool(b) and not b.get("stagger_s") and cpz_test(r.get("calls_per_zip"))
+            and (size is None or b["calls"] == size))
 
 
 def _range(vals, fmt):

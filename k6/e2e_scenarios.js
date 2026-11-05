@@ -63,6 +63,8 @@ const totalMin = PLAN.stages.reduce((a, s) => a + s.minutes, 0);
 const BURST_ZIPS = PLAN.burst ? Math.max(1, parseInt(PLAN.burst.zips, 10)) : 0;
 // Browse window for bursts. run_e2e.py passes a long cap and stops k6 once the burst is processed.
 const BURST_BROWSE_S = parseInt(env('BURST_BROWSE_S', '300'), 10);
+// Optional, non-standard: start zip k after k × stagger seconds instead of all at once (run_burst.py --stagger-s).
+const BURST_STAGGER_S = PLAN.burst ? Math.max(0, Number(PLAN.burst.stagger_s || 0)) : 0;
 
 const scenarios = BURST_ZIPS ? {
   upload: {
@@ -200,6 +202,7 @@ async function buildZip(entries) {
 // ─── Scenario: upload one zip of CALLS_PER_ZIP calls ─────────────────────────
 export async function uploadZip() {
   const it = exec.scenario.iterationInTest; // unique across VUs → unique filenames
+  if (BURST_STAGGER_S > 0) sleep(it * BURST_STAGGER_S); // one VU per zip: zip k starts at k × stagger
   const entries = [];
   for (let j = 0; j < CALLS_PER_ZIP; j++) {
     const idx = (it * CALLS_PER_ZIP + j) % SOURCES.length;

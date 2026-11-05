@@ -104,16 +104,18 @@ def group(results):
             continue
         b = B.burst_numbers(r)
         b["result"] = r
-        runs[(b["size"], int(r.get("calls_per_zip") or 25))].append(b)  # same size, different zip packaging = separate group
+        stagger = int(((r.get("plan") or {}).get("burst") or {}).get("stagger_s") or 0)
+        # Same size but different zip packaging or a staggered (non-standard) upload = separate group
+        runs[(b["size"], int(r.get("calls_per_zip") or 25), stagger)].append(b)
     out = []
-    for size, cpz in sorted(runs):
-        rs = sorted(runs[(size, cpz)], key=lambda b: b["result"].get("started_utc", ""))
+    for size, cpz, stagger in sorted(runs):
+        rs = sorted(runs[(size, cpz, stagger)], key=lambda b: b["result"].get("started_utc", ""))
         med_total = median([b["total_s"] for b in rs])
         rep = min(rs, key=lambda b: abs((b["total_s"] or 0) - med_total))  # run closest to typical
         zips = -(-size // cpz)
         out.append({
-            "size": size, "cpz": cpz, "zips": zips, "key": f"{size}x{cpz}",
-            "label": f"{size:,} calls · {zips} zip{'s' if zips > 1 else ''} of {cpz}",
+            "size": size, "cpz": cpz, "zips": zips, "key": f"{size}x{cpz}" + (f"s{stagger}" if stagger else ""),
+            "label": f"{size:,} calls · {zips} zip{'s' if zips > 1 else ''} of {cpz}" + (f" · staggered {stagger} s" if stagger else ""),
             "runs": rs, "rep": rep, "n": len(rs),
             "total": med_total, "best": min(b["total_s"] for b in rs), "worst": max(b["total_s"] for b in rs),
             "upload_s": median([b["upload_s"] for b in rs]), "created_s": median([b["created_s"] for b in rs]),

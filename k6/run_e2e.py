@@ -18,6 +18,7 @@ import argparse
 import http.client
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -41,15 +42,16 @@ STEP_MIN = 10  # minutes per step in the "step" scenario
 
 
 # ─── Scenarios (calls/min). Everything scales from PEAK_CALLS_PER_MIN. ─────────
-def scenarios(peak: int, soak_minutes: int, per_hour: int = 40000, target_minutes: int = 60) -> dict:
+def scenarios(peak: int, soak_minutes: int, per_hour: int = 40000, target_minutes: int = 60,
+              step_rates=None, step_min: float = STEP_MIN) -> dict:
     load_r, soak_r, base_r = round(peak * 0.6), round(peak * 0.5), round(peak * 0.2)
     hour_r = per_hour / 60
-    # Step test: hold each rate STEP_MIN minutes, climbing to the hourly target (10 s jumps between steps).
-    step_rates = [200, 300, 450, round(hour_r)]
-    step_stages = [st for r in step_rates for st in ((1 / 6, r), (STEP_MIN - 1 / 6, r))]
+    # Step test: hold each rate step_min minutes (10 s jumps between steps). Default climbs to the hourly target.
+    step_rates = list(step_rates or [200, 300, 450, round(hour_r)])
+    step_stages = [st for r in step_rates for st in ((1 / 6, r), (step_min - 1 / 6, r))]
     return {
-        "step": {"desc": "Step-up to " + f"{per_hour:,}/hour: " + " -> ".join(f"{r}/min" for r in step_rates)
-                         + f", {STEP_MIN} min each; stops at the first failing step",
+        "step": {"desc": "Step-up: " + " -> ".join(f"{r:,}/min" for r in step_rates)
+                         + f", {step_min:g} min each; stops at the first failing step",
                  "start": 0, "stages": step_stages, "unit": 60},
         # Constant arrival at a calls-per-HOUR target; "unit": 60 makes k6 pace zips per hour, so e.g.
         # 40,000/h in zips of 100 is exactly 400 zips/h instead of rounding to 7 zips/min (42,000).
@@ -105,6 +107,27 @@ def build_manifest(source_dir: Path, out: Path) -> list:
     return manifest
 
 
+DONE = "all uploaded calls processed"
+SKIP_STATES = {"not_reviewed", "not_eligible"}  # sampling skips: finished on purpose
+
+
+def display_num(item):
+    """CALL-12345 -> 12345 (display numbers are handed out in sequence per tenant); None if absent."""
+    digits = "".join(ch for ch in str(item.get("display_id") or "") if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def call_state(item) -> str:
+    """analysed | skipped | failed | in_progress, from the fields the Call Review page uses."""
+    if (item.get("qa_status") or "") == "failed":
+        return "failed"
+    if (item.get("review_state") or "") in SKIP_STATES:
+        return "skipped"
+    if item.get("qa_status") == "completed" or item.get("score_percentage") is not None:
+        return "analysed"
+    return "in_progress"
+
+
 # ─── Pipeline tracker (own token handling; runs alongside k6) ────────────────
 class Tracker:
     def __init__(self, base, token, refresh, group_id):
@@ -147,6 +170,30 @@ class Tracker:
             except (OSError, http.client.HTTPException, ValueError) as e:  # resets, disconnects, bad JSON
                 raise ApiError(f"GET {path.split('?')[0]}: {e}")
         raise ApiError("unreachable")
+
+    def open_calls(self, max_pages: int = 60):
+        """{call id: (state, display number)} for every unfinished call ('in_progress' | 'failed') in the group,
+        from the Call Review 'under review' tab. None when there are more than max_pages × 100."""
+        out = {}
+        for page in range(1, max_pages + 1):
+            with self.lock:
+                body = self._get(f"/qa/calls?group_ids={self.group}&tab=call_under_review&page={page}&page_size=100")
+            data = body.get("data") or {}
+            items = data.get("items") or []
+            for it in items:
+                state = call_state(it)
+                if state in ("in_progress", "failed"):
+                    out[it.get("id")] = (state, display_num(it))
+            pages = (data.get("pagination") or {}).get("total_pages")
+            if not items or (pages and page >= pages):
+                return out
+        return None
+
+    def newest_display(self) -> int:
+        """Highest display number among the group's most recently created calls (0 if none)."""
+        with self.lock:
+            body = self._get(f"/qa/calls?group_ids={self.group}&page=1&page_size=100&sort_by=date:desc")
+        return max((display_num(it) or 0 for it in (body.get("data") or {}).get("items") or []), default=0)
 
     def counts(self) -> dict:
         """Absolute counts in the group: total, scored (evaluated), skipped (sampling/too short)."""
@@ -191,54 +238,123 @@ def _k6_metric(address: str, metric: str, field: str = "count") -> float:
         return 0.0
 
 
-def _watch_steps(proc, plan, timeline, consec_fail, server_down_after, cpz, cfg, k6_addr, t0):
-    """Step scenario: stop k6 at the first failing step. Returns {step, rate, reason, t} or None.
+def _watch_steps(proc, plan, timeline, consec_fail, server_down_after, cpz, cfg, k6_addr, t0, run_open=None):
+    """Step scenario: stop k6 at the first failing step. Returns (stop, steps):
+    stop = {step, rate, reason, t, passed_rate} or None; steps = one summary per step (intake and analysis).
 
     A step fails when uploads are rejected (STEP_FAIL_ZIPS failed zips) or the API falls more than
     STEP_MAX_BACKLOG_ZIPS zips behind in unpacking (beyond that the DB pool runs out, as in the 40-zip burst).
+    Each step also records whether analysis kept up: this run's analysis backlog grew by no more than one
+    minute of that step's calls. With STEP_STOP_ON_ANALYSIS=true, falling behind also fails the step.
+    run_open() gives this run's own unfinished calls (leftovers excluded); without it, group totals are used.
     """
     fail_zips = int(cfg.get("STEP_FAIL_ZIPS", "2"))
     max_backlog = int(cfg.get("STEP_MAX_BACKLOG_ZIPS", "10")) * cpz
+    stop_on_analysis = cfg.get("STEP_STOP_ON_ANALYSIS", "false").lower() == "true"
     bounds, acc = [], 0.0  # (end_s, calls/min) per hold stage
     for st in plan["stages"]:
         acc += st["minutes"] * 60
         bounds.append((acc, st["callsPerMin"]))
     step_rates = list(dict.fromkeys(r for _, r in bounds))
-    last_step = None
+    steps, mark = [], None  # mark = snapshot at the start of the current step
+
+    def snapshot():
+        s = timeline[-1] if timeline else {"ingested": 0, "processed": 0}
+        own = None
+        if run_open:
+            try:
+                own = run_open()
+            except ApiError as e:
+                print(f"[step] own-call check failed: {e}", file=sys.stderr)
+        backlog = min(sum(own), s["ingested"]) if own is not None else s["ingested"] - s["processed"]
+        return {"t": time.time() - t0, "ingested": s["ingested"], "backlog": backlog, "exact": own is not None}
+
+    def close_step(step, rate):
+        end = snapshot()
+        mins = max((end["t"] - mark["t"]) / 60, 1 / 60)
+        created = (end["ingested"] - mark["ingested"]) / mins
+        analysed = created - (end["backlog"] - mark["backlog"]) / mins
+        kept_up = end["backlog"] - mark["backlog"] <= rate  # grew by at most one minute of calls
+        steps.append({"step": step, "rate": rate, "minutes": round(mins, 1), "created_per_min": round(created),
+                      "analysed_per_min": round(analysed), "backlog_start": mark["backlog"],
+                      "backlog_end": end["backlog"], "analysis_kept_up": kept_up, "exact": end["exact"] and mark["exact"]})
+        print(f"[step] Step {step} result: sent {rate}/min, created {created:.0f}/min, analysed {analysed:.0f}/min, "
+              f"backlog {mark['backlog']:,} -> {end['backlog']:,}: analysis {'kept up' if kept_up else 'FELL BEHIND'}"
+              f"{'' if steps[-1]['exact'] else ' (group totals)'}")
+        return kept_up
+
+    last_step = last_rate = None
     while proc.poll() is None:
         t = time.time() - t0
         rate = next((r for end, r in bounds if t < end), bounds[-1][1])
         step = step_rates.index(rate) + 1
-        if step != last_step:
-            print(f"[step] >>> Step {step}/{len(step_rates)}: {rate}/min ({rate * 60:,}/hour) from +{int(t) // 60}m")
-            last_step = step
         reason = None
-        failed = _k6_metric(k6_addr, "zips_failed")
-        uploaded = _k6_metric(k6_addr, "calls_uploaded")
-        s = timeline[-1] if timeline else None
-        if failed >= fail_zips:
-            reason = f"{int(failed)} zip uploads rejected by the API"
-        elif s and uploaded - s["ingested"] > max_backlog:
-            reason = (f"API {int(uploaded - s['ingested']):,} calls behind in unpacking "
-                      f"(> {max_backlog // cpz} zips; DB pool would run out)")
-        elif consec_fail[0] >= server_down_after:
-            reason = f"server not responding ({consec_fail[0]} failed checks in a row)"
+        if step != last_step:
+            if last_step is not None and not close_step(last_step, last_rate) and stop_on_analysis:
+                reason = "analysis fell behind"
+                step, rate = last_step, last_rate
+            else:
+                print(f"[step] >>> Step {step}/{len(step_rates)}: {rate}/min ({rate * 60:,}/hour) from +{int(t) // 60}m")
+                last_step, last_rate, mark = step, rate, snapshot()
+        if not reason:
+            failed = _k6_metric(k6_addr, "zips_failed")
+            uploaded = _k6_metric(k6_addr, "calls_uploaded")
+            s = timeline[-1] if timeline else None
+            if failed >= fail_zips:
+                reason = f"{int(failed)} zip uploads rejected by the API"
+            elif s and uploaded - s["ingested"] > max_backlog:
+                reason = (f"API {int(uploaded - s['ingested']):,} calls behind in unpacking "
+                          f"(> {max_backlog // cpz} zips; DB pool would run out)")
+            elif consec_fail[0] >= server_down_after:
+                reason = f"server not responding ({consec_fail[0]} failed checks in a row)"
+            if reason:
+                close_step(step, rate)
         if reason:
             print(f"[step] XXX STEP {step} FAILED at {rate}/min: {reason} - stopping uploads.")
             _k6_stop(k6_addr)
-            return {"step": step, "rate": rate, "reason": reason, "t": round(t),
-                    "passed_rate": step_rates[step - 2] if step > 1 else None}
+            return ({"step": step, "rate": rate, "reason": reason, "t": round(t),
+                     "passed_rate": step_rates[step - 2] if step > 1 else None}, steps)
         time.sleep(10)
+    if last_step is not None and not close_step(last_step, last_rate) and stop_on_analysis:
+        print(f"[step] XXX STEP {last_step} FAILED at {last_rate}/min: analysis fell behind.")
+        return ({"step": last_step, "rate": last_rate, "reason": "analysis fell behind", "t": round(time.time() - t0),
+                 "passed_rate": step_rates[last_step - 2] if last_step > 1 else None}, steps)
     print("[step] All steps completed without a failure.")
-    return None
+    return None, steps
 
 
-def burst_spec(calls: int, calls_per_zip: int) -> dict:
-    """All `calls` sent at once as ceil(calls/calls_per_zip) zips uploaded in parallel."""
+def burst_spec(calls: int, calls_per_zip: int, stagger_s: int = 0) -> dict:
+    """All `calls` sent at once as ceil(calls/calls_per_zip) zips uploaded in parallel.
+
+    stagger_s > 0 starts zip k after k × stagger_s seconds instead (a gentler, NON-standard test:
+    its results are labelled and kept apart from the standard bursts in every report)."""
     zips = -(-calls // calls_per_zip)
-    return {"desc": f"Burst: {calls:,} calls sent at once ({zips} zips uploaded in parallel)",
-            "plan": {"name": f"burst{calls}", "startCallsPerMin": 0, "stages": [], "burst": {"zips": zips, "calls": calls}},
+    how = f"zips started {stagger_s} s apart" if stagger_s else "zips uploaded in parallel"
+    burst = {"zips": zips, "calls": calls, **({"stagger_s": stagger_s} if stagger_s else {})}
+    return {"desc": f"Burst: {calls:,} calls ({zips} {how})",
+            "plan": {"name": f"burst{calls}", "startCallsPerMin": 0, "stages": [], "burst": burst},
             "curve": [(0, 0.0), (1, float(zips * calls_per_zip))], "planned_calls": zips * calls_per_zip}
+
+
+def _first_line(cmd) -> str:
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=HERE)
+        return (out.stdout or out.stderr).strip().splitlines()[0] if out.returncode == 0 else "unknown"
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return "unknown"
+
+
+def run_setup(ctx, plan) -> dict:
+    """What the run was measured with, so a different result can be traced to a different setup."""
+    cfg = ctx["cfg"]
+    return {
+        "git_commit": _first_line(["git", "rev-parse", "--short", "HEAD"]),
+        "k6_version": _first_line([ctx["k6"], "version"]) if ctx.get("k6") else "unknown",
+        "python": platform.python_version(), "load_generator": platform.node(),
+        "calls_per_zip": ctx["calls_per_zip"], "poll_interval_s": ctx["poll_s"],
+        "browse_users": int(cfg.get("BROWSE_VUS", "5")), "ai_mode": cfg.get("AI_MODE", "unknown").lower(),
+        "zips": (plan.get("burst") or {}).get("zips"), "stagger_s": (plan.get("burst") or {}).get("stagger_s", 0),
+    }
 
 
 def run_one(name, ctx, spec=None) -> tuple:
@@ -246,7 +362,7 @@ def run_one(name, ctx, spec=None) -> tuple:
     cfg, tracker, results_dir = ctx["cfg"], ctx["tracker"], ctx["results_dir"]
     cpz = ctx["calls_per_zip"]
     if spec is None:
-        sc = scenarios(ctx["peak"], ctx["soak_min"], ctx["per_hour"], ctx["target_min"])[name]
+        sc = scenarios(ctx["peak"], ctx["soak_min"], ctx["per_hour"], ctx["target_min"], ctx["step_rates"], ctx["step_min"])[name]
         curve = planned_curve(sc["start"], sc["stages"], cpz, unit=sc.get("unit", 1))
         plan = {"name": name, "startCallsPerMin": sc["start"], "unitMinutes": sc.get("unit", 1),
                 "stages": [{"minutes": m, "callsPerMin": r} for m, r in sc["stages"]]}
@@ -269,17 +385,34 @@ def run_one(name, ctx, spec=None) -> tuple:
             if time.time() > deadline:
                 print(f"[{name}] Pre-run backlog still {backlog} after {ctx['predrain_max_min']} min; starting anyway.")
                 break
-            if prev is None and backlog <= ctx["stuck_ok"]:
+            if backlog <= ctx["stuck_ok"]:  # any check: QAT's totals can even go negative once the backlog clears
                 break
             print(f"[{name}] Waiting for {backlog:,} leftover calls in the group to finish before starting...")
             prev = backlog
             time.sleep(60)
         baseline = tracker.counts()
+        # Calls already unfinished now are not this run's: remember them so they never count as its progress.
+        # Paging a long list can miss a few that move between pages, so the run's calls must ALSO be numbered
+        # after every call that existed now (display numbers are handed out in sequence).
+        leftovers = tracker.open_calls()
+        first_new = max([tracker.newest_display()] + [dn or 0 for _, dn in (leftovers or {}).values()]) + 1
     except (ApiError, KeyboardInterrupt) as e:
         print(f"ERROR before start: {e}", file=sys.stderr)
         return None, isinstance(e, KeyboardInterrupt)
     print(f"\n=== {name}: {sc['desc']} - ~{planned_calls:,} calls ===")
-    print(f"Baseline in group: {baseline['total']} calls, {baseline['scored']} scored, {baseline['skipped']} skipped\n")
+    print(f"Baseline in group: {baseline['total']} calls, {baseline['scored']} scored, {baseline['skipped']} skipped")
+    print(f"Leftover unfinished calls excluded from this run's progress: {len(leftovers):,} "
+          f"(this run's calls are numbered from {first_new:,})\n" if leftovers is not None
+          else "Too many unfinished calls to list; progress uses group totals only\n")
+
+    def run_open():
+        """(in progress, failed) among THIS run's calls: unfinished calls that are not leftovers and are
+        numbered from first_new on."""
+        now = tracker.open_calls()
+        if now is None or leftovers is None:
+            return None
+        mine = [st for cid, (st, dn) in now.items() if cid not in leftovers and dn is not None and dn >= first_new]
+        return mine.count("in_progress"), mine.count("failed")
 
     timeline, poll_errors = [], [0]
     t0 = time.time()
@@ -287,6 +420,9 @@ def run_one(name, ctx, spec=None) -> tuple:
 
     consec_fail = [0]  # consecutive failed polls: the server-down signal
     server_down_after = int(cfg.get("SERVER_DOWN_POLLS", "4"))  # 4 × poll interval (~1 min for bursts)
+    # The own-call check reads the whole 'under review' list, so it runs only once every call is uploaded
+    # (or all planned calls exist), and then on every OWN_CHECK_EVERY-th poll, to keep load off QAT.
+    own_check = {"uploads_done": False, "polls": 0, "every": max(1, int(cfg.get("OWN_CHECK_EVERY", "2")))}
 
     def sample():
         try:
@@ -302,6 +438,22 @@ def run_one(name, ctx, spec=None) -> tuple:
              "scored": max(0, c["scored"] - baseline["scored"]),
              "skipped": max(0, c["skipped"] - baseline["skipped"])}
         s["processed"] = s["scored"] + s["skipped"]
+        # Group totals over-count when leftovers finish during the run. Near the end (uploads finished and the
+        # group looks close to done), count this run's own unfinished calls instead, so "done" means its calls are done.
+        near_end = (leftovers is not None and (own_check["uploads_done"] or s["ingested"] >= planned_calls)
+                    and s["ingested"] - s["processed"] <= len(leftovers) + cpz)
+        if near_end:
+            own_check["polls"] += 1
+        if near_end and own_check["polls"] % own_check["every"] == 1 % own_check["every"]:
+            try:
+                mine = run_open()
+            except ApiError as e:
+                print(f"[tracker] own-call check failed: {e}", file=sys.stderr)
+                mine = None
+            if mine is not None:
+                open_, failed = min(mine[0], s["ingested"]), min(mine[1], s["ingested"])  # never more than created
+                s["run_open"], s["run_failed"] = open_, failed
+                s["processed"] = max(0, s["ingested"] - open_ - failed)
         timeline.append(s)
         return s
 
@@ -309,8 +461,9 @@ def run_one(name, ctx, spec=None) -> tuple:
         while not stop_polling.wait(ctx["poll_s"]):
             s = sample()
             if s:
+                own = (f"  (this run: {s['run_open']} open, {s['run_failed']} failed)" if "run_open" in s else "")
                 print(f"[{name} +{s['t'] // 60:>3}m{s['t'] % 60:02d}s] created {s['ingested']:>6}  scored {s['scored']:>6}  "
-                      f"skipped {s['skipped']:>5}  backlog {s['ingested'] - s['processed']:>6}")
+                      f"skipped {s['skipped']:>5}  backlog {s['ingested'] - s['processed']:>6}{own}")
 
     summary_path = results_dir / f"e2e_{name}_{stamp}_k6.json"
     # Hand k6 the tracker's current tokens (refreshed between scenarios in a sequence).
@@ -335,17 +488,18 @@ def run_one(name, ctx, spec=None) -> tuple:
         # Burst / step: k6 is stopped through its REST API (graceful: the summary is still written).
         k6_cmd += ["--address", k6_addr]
     proc = subprocess.Popen(k6_cmd + ["e2e_scenarios.js"], cwd=HERE, env=child_env)
-    step_stop = None
+    step_stop, steps = None, []
     try:
         if name == "step":
-            step_stop = _watch_steps(proc, plan, timeline, consec_fail, server_down_after, cpz, cfg, k6_addr, t0)
+            step_stop, steps = _watch_steps(proc, plan, timeline, consec_fail, server_down_after, cpz, cfg, k6_addr, t0,
+                                            run_open if leftovers is not None else None)
             server_down = bool(step_stop and step_stop["reason"].startswith("server"))
         elif spec is not None:
             stop_sent = False
             while proc.poll() is None:
                 s = timeline[-1] if timeline else None
                 if (not stop_sent and s and s["ingested"] >= planned_calls
-                        and s["processed"] >= planned_calls):
+                        and (s["processed"] >= planned_calls or s.get("run_open") == 0)):
                     print(f"[{name}] All {planned_calls:,} calls processed - stopping the browsing users.")
                     stop_sent = _k6_stop(cfg.get("K6_API_ADDRESS", K6_API_DEFAULT))
                 if not stop_sent and consec_fail[0] >= server_down_after:
@@ -365,6 +519,7 @@ def run_one(name, ctx, spec=None) -> tuple:
             proc.kill()
             rc = 130
     upload_end_s = round(time.time() - t0)
+    own_check["uploads_done"] = True
 
     k6_summary = {}
     if summary_path.is_file():
@@ -384,7 +539,10 @@ def run_one(name, ctx, spec=None) -> tuple:
             while True:
                 s = timeline[-1] if timeline else None
                 if s and s["ingested"] >= uploaded and s["processed"] >= uploaded:
-                    end_reason = "all uploaded calls processed"
+                    end_reason = DONE
+                    break
+                if s and s["ingested"] >= uploaded and s.get("run_open") == 0 and s.get("run_failed"):
+                    end_reason = f"all calls finished; {s['run_failed']} failed in the pipeline"
                     break
                 key = (s["ingested"], s["processed"]) if s else None
                 if key != last_key:
@@ -417,9 +575,13 @@ def run_one(name, ctx, spec=None) -> tuple:
         "planned_calls": planned_calls, "uploaded_calls": uploaded, "upload_end_s": upload_end_s,
         "baseline": baseline, "timeline": timeline, "final": final, "poll_errors": poll_errors[0],
         "end_reason": end_reason, "k6_exit_code": rc, "k6": e2e_report.k6_extract(k6_summary),
-        "t0_epoch": t0, "k6_csv": csv_path.name, "step_stop": step_stop,
+        "t0_epoch": t0, "k6_csv": csv_path.name, "step_stop": step_stop, "steps": steps,
+        "leftovers_at_start": len(leftovers) if leftovers is not None else None,
         "ai_mode": cfg.get("AI_MODE", "unknown").lower(),  # mock | real | unknown, for the reports' wording
+        "setup": run_setup(ctx, plan),
     }
+    out_json = results_dir / f"e2e_{name}_{stamp}.json"
+    result["result_file"] = str(out_json)  # lets follow-up steps (per-call verification) write beside it
     if csv_path.is_file():
         try:
             result["k6_series"] = e2e_report.k6_timeseries(csv_path, t0)
@@ -428,7 +590,6 @@ def run_one(name, ctx, spec=None) -> tuple:
                 result["upload_end_s"] = result["k6_series"]["upload_last_end_s"]
         except (OSError, ValueError) as err:
             print(f"Could not read k6 CSV for graphs: {err}", file=sys.stderr)
-    out_json = results_dir / f"e2e_{name}_{stamp}.json"
     out_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
     out_html = out_json.with_suffix(".html")
     out_html.write_text(e2e_report.render([result]), encoding="utf-8")
@@ -445,9 +606,24 @@ def main() -> int:
     ap.add_argument("--soak-minutes", type=int, help="soak hold time (default SOAK_MINUTES or 60)")
     ap.add_argument("--per-hour", type=int, help="'target' scenario: calls per hour (default TARGET_CALLS_PER_HOUR or 40000)")
     ap.add_argument("--minutes", type=int, help="'target' scenario: how long to keep sending (default TARGET_MINUTES or 60)")
+    ap.add_argument("--step-rates", help="'step' scenario: calls/min per step, e.g. 100,200,500,1000 "
+                                         "(default 200,300,450 then the hourly target)")
+    ap.add_argument("--step-minutes", type=float, help=f"'step' scenario: minutes per step (default {STEP_MIN})")
     ap.add_argument("--only", help="with 'all': comma-separated subset, e.g. load,peak")
+    ap.add_argument("--no-verify", action="store_true", help="skip the per-call check against QAT after each run")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
+    try:
+        step_rates = [int(x) for x in args.step_rates.split(",") if x.strip()] if args.step_rates else None
+    except ValueError:
+        print("--step-rates must be comma-separated whole numbers (calls/min)", file=sys.stderr)
+        return 2
+    if step_rates is not None and (not step_rates or any(not 1 <= r <= 5000 for r in step_rates)):
+        print("--step-rates must be 1..5000 calls/min each", file=sys.stderr)
+        return 2
+    if args.step_minutes is not None and not 1 <= args.step_minutes <= 60:
+        print("--step-minutes must be 1..60", file=sys.stderr)
+        return 2
 
     cfg = load_env_file(args.env_file)
     for k in ("BASE_URL", "PERF_EMAIL", "GROUP_ID", "SOURCE_DIR"):
@@ -461,6 +637,7 @@ def main() -> int:
         "soak_min": args.soak_minutes or int(cfg.get("SOAK_MINUTES", "60")),
         "per_hour": args.per_hour or int(cfg.get("TARGET_CALLS_PER_HOUR", "40000")),
         "target_min": args.minutes or int(cfg.get("TARGET_MINUTES", "60")),
+        "step_rates": step_rates, "step_min": args.step_minutes or STEP_MIN,
         "calls_per_zip": int(cfg.get("CALLS_PER_ZIP", "25")),
         "poll_s": int(cfg.get("POLL_INTERVAL_S", "30")),
         "stall_min": int(cfg.get("STALL_TIMEOUT_MIN", "20")),
@@ -490,7 +667,7 @@ def main() -> int:
     total_calls, total_min = 0, 0.0
     print()
     for n in names:
-        sc = scenarios(ctx["peak"], ctx["soak_min"], ctx["per_hour"], ctx["target_min"])[n]
+        sc = scenarios(ctx["peak"], ctx["soak_min"], ctx["per_hour"], ctx["target_min"], ctx["step_rates"], ctx["step_min"])[n]
         calls = int(planned_curve(sc["start"], sc["stages"], ctx["calls_per_zip"], unit=sc.get("unit", 1))[-1][1])
         mins = sum(m for m, _ in sc["stages"])
         total_calls, total_min = total_calls + calls, total_min + mins
@@ -529,6 +706,10 @@ def main() -> int:
                 print("Stopped before the next scenario.")
                 break
         res, interrupted = run_one(n, ctx)
+        if res and not args.no_verify and res.get("uploaded_calls") and (
+                res["end_reason"] == DONE or res["end_reason"].startswith("all calls finished")):
+            import verify_run  # noqa: PLC0415  (imports this module; loaded only when needed)
+            verify_run.verify_and_save(res, cfg, ctx["tracker"], ctx["poll_s"])
         if res:
             results.append(res)
         if interrupted or res is None:
@@ -540,7 +721,7 @@ def main() -> int:
         out = ctx["results_dir"] / f"e2e_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         out.write_text(e2e_report.render(results), encoding="utf-8")
         print(f"\nCombined report: {out}")
-    ok = bool(results) and all(r["end_reason"] == "all uploaded calls processed" for r in results)
+    ok = bool(results) and all(r["end_reason"] == DONE for r in results)
     return 0 if ok and len(results) == len(names) else 1
 
 

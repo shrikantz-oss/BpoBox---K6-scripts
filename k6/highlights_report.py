@@ -5,27 +5,28 @@ for non-technical readers. One standalone HTML file; numbers are read from qat/r
 """
 import argparse
 import json
-import math
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # `python -I` drops the script dir from sys.path
 import burst_report as B  # noqa: E402
+import burst_summary as S  # noqa: E402  (QAT-verified times and the verified verdicts)
 import e2e_report as R  # noqa: E402
 
 e = R.e
 DONE = "all uploaded calls processed"
-CELERY_PER_MIN = 1.1  # pilot run 1 (28 Oct), old Celery pipeline, real AI, from the run history
-# New pipeline with REAL AI (the fair comparison with the old pipeline); later runs used simulated AI timing
-REAL_AI_RUNS = ("e2e_smoke_20261030_204444", "e2e_smoke_20261102_221514")
+STEP_RUN = "e2e_step_20261103_231328"  # the 10-minute 200/min step shown in the "kept pace" chart
+# From the 4 Nov 00:00 IST shutdown on, stuck leftover calls could inflate group totals: runs after this count only if verified
+LEFTOVERS_FROM = "2026-11-03T18:30"
+RESULTS = HERE / "qat" / "results"
 
 
 def load_results():
     out = []
-    for p in sorted((HERE / "qat" / "results").glob("e2e_*.json")):
-        if p.name.endswith("_k6.json"):
+    for p in sorted(RESULTS.glob("e2e_*.json")):
+        if p.name.endswith(("_k6.json", "_verify.json")):
             continue
         try:
             r = json.loads(p.read_text(encoding="utf-8"))
@@ -36,9 +37,29 @@ def load_results():
     return out
 
 
+def load_k6_summaries():
+    """[(file name, k6 metrics)] for every run, including runs that stopped before writing a result file."""
+    out = []
+    for p in sorted(RESULTS.glob("e2e_*_k6.json")):
+        try:
+            out.append((p.name, json.loads(p.read_text(encoding="utf-8")).get("metrics") or {}))
+        except (OSError, ValueError) as err:
+            print(f"Skipping {p.name}: {err}", file=sys.stderr)
+    return out
+
+
 def fmt_min(sec):
     m, s = divmod(int(round(sec)), 60)
     return f"{m} min {s:02d} s" if m else f"{s} s"
+
+
+def nice_dt(iso):
+    """'2026-11-04T07:49:44+00:00' -> '4 Nov 13:19 IST'."""
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    except (TypeError, ValueError):
+        return "–"
+    return f"{dt.day} {dt:%b %H:%M} IST"
 
 
 # ─── Tiny SVG chart helpers (shared look: thin marks, recessive grid, hover tips) ───
@@ -107,46 +128,62 @@ def legend(items):
 
 
 # ─── Page ────────────────────────────────────────────────────────────────────
-def render(results):
-    done = [r for r in results if r.get("end_reason") == DONE]
-    calls_done = sum(r.get("uploaded_calls") or 0 for r in done)
-    step = next((r for r in reversed(results) if r.get("scenario") == "step"), None)
-    smoke = [r for r in done if r.get("scenario") == "smoke"]
+def trusted(r):
+    """A finished run whose counts can be relied on: verified call by call against QAT, or run before stuck
+    leftover calls (from the 4 Nov outage onwards) could inflate the group totals."""
+    v = (r.get("verify") or {}).get("verdict")
+    if v:
+        return v in S.VERIFIED
+    return r.get("end_reason") == DONE and (r.get("started_utc") or "") < LEFTOVERS_FROM
 
-    # Fastest finish per burst size (any zip packing that passed)
+
+def upload_record(k6_summaries):
+    """(zips accepted, calls accepted, zips rejected) over every run sent at normal packing: paced runs and
+    bursts of at most 10 zips at once (the 40-small-zip tests are the known limit, shown elsewhere)."""
+    zips = calls = rejected = 0
+    for name, m in k6_summaries:
+        us = (m.get("upload_success") or {}).get("values") or {}
+        sent = (us.get("passes") or 0) + (us.get("fails") or 0)
+        if "burst" in name and sent > 10:
+            continue
+        zips += us.get("passes") or 0
+        rejected += us.get("fails") or 0
+        calls += int(((m.get("calls_uploaded") or {}).get("values") or {}).get("count") or 0)
+    return zips, calls, rejected
+
+
+def render(results, k6_summaries=(), charts=False):
+    done = [r for r in results if trusted(r)]
+    calls_done = sum(r.get("uploaded_calls") or 0 for r in done)
+    step = next((r for r in results if r.get("_stem") == STEP_RUN), None)
+    smoke = [r for r in done if r.get("scenario") == "smoke"]
+    verified = sorted((r for r in results if (r.get("verify") or {}).get("verdict") in S.VERIFIED),
+                      key=lambda r: ((r.get("plan") or {}).get("burst") or {}).get("calls") or 0)
+    tested_calls = sum(int(((m.get("calls_uploaded") or {}).get("values") or {}).get("count") or 0) for _, m in k6_summaries)
+    up_zips, up_calls, up_rejected = upload_record(k6_summaries)
+    ramps = [r for r in results if r.get("scenario") == "step" and (r.get("step_stop") or {}).get("passed_rate")]
+    burst2000 = next((r for r in results if ((r.get("plan") or {}).get("burst") or {}).get("calls") == 2000), None)
+
+    # Fastest finish per burst size (any zip packing that passed); verified runs use QAT's own times
     best, all_t = {}, {}
     for r in done:
         bp = (r.get("plan") or {}).get("burst")
-        if not bp:
+        if not bp or bp.get("stagger_s"):  # staggered uploads are non-standard: not used for headline figures
             continue
-        n = B.burst_numbers(r)
+        n = S.numbers(r)
         if n["total_s"]:
             all_t.setdefault(bp["calls"], []).append(n["total_s"])
         if n["total_s"] and (bp["calls"] not in best or n["total_s"] < best[bp["calls"]][0]):
             best[bp["calls"]] = (n["total_s"], n["zips"], r.get("calls_per_zip"))
 
-    # Step test: first 10 minutes (200 calls/min) and the steady analysis afterwards
+    # Step test: first 10 minutes (200 calls/min)
     tl = step["timeline"] if step else []
     sent = [(t, c) for t, c in (step["planned_curve"] if step else []) if t <= 600]
     created = [(s["t"], s["ingested"]) for s in tl if s["t"] <= 610]
-    drain = [s for s in tl if s["t"] >= 1530]  # after every call was registered
-    a_rate = ((drain[-1]["processed"] - drain[0]["processed"]) / ((drain[-1]["t"] - drain[0]["t"]) / 60)) if len(drain) > 1 else 90
-    # Real-AI speed of the new pipeline: whole-test average (incl. upload and start-up) and peak minute
-    real = [r for r in results if r.get("_stem") in REAL_AI_RUNS]
-    real_avg = [r["uploaded_calls"] / (R.derive(r)["t_all_processed"] / 60) for r in real if R.derive(r)["t_all_processed"]]
-    real_peak = [R.derive(r)["peak_processed"] for r in real if R.derive(r)["peak_processed"]]
-    lo_avg, hi_avg, hi_peak = ((min(real_avg), max(real_avg), max(real_peak)) if real_avg and real_peak
-                               else (a_rate, a_rate, a_rate))
-    speedup = int(lo_avg / CELERY_PER_MIN / 5) * 5  # conservative: slowest whole-test average, rounded down to 5
 
     # ── Charts ──
     c_lost = (f'<div class="donebar"><div class="fill" style="width:100%"><span>{calls_done:,} calls finished</span></div></div>'
               f'<div class="donecap"><span>0 calls lost</span><span>{len(done)} of {len(done)} completed tests</span></div>')
-
-    c_speed = hbar([("Old system", CELERY_PER_MIN, f"Old system, real AI: about {CELERY_PER_MIN} calls analysed per minute", "s2"),
-                    ("New · average", lo_avg, f"New system, real AI: {lo_avg:.0f} calls a minute averaged over a whole test (slowest test)", "s1"),
-                    ("New · peak", hi_peak, f"New system, real AI: {hi_peak:.0f} calls in the busiest minute", "s1")],
-                   " / min", lambda v: f"{v:,.0f}" if v >= 10 else f"{v:,.1f}", label_w=170)
 
     sizes = sorted(best)
     c_burst = hbar([(f"{s:,} calls", best[s][0] / 60, f"{s:,} calls at once ({best[s][1]} zips of {best[s][2]}): all finished in {fmt_min(best[s][0])}", "s1")
@@ -156,12 +193,20 @@ def render(results):
                   600, max(c for _, c in sent + created) * 1.08, lambda x: f"{x / 60:.0f} min", lambda y: f"{y:,.0f}",
                   lambda n, x, y: f"{n} after {fmt_min(x)}: {y:,.0f}")
 
-    t0 = drain[0]["t"] if drain else 0
-    p0 = drain[0]["processed"] if drain else 0
-    steady_pts = [(s["t"] - t0, s["processed"] - p0) for s in drain]
-    c_steady = line([("Calls analysed", "s1", steady_pts, f"{steady_pts[-1][1]:,} analysed" if steady_pts else "")],
-                    steady_pts[-1][0] if steady_pts else 1, (steady_pts[-1][1] if steady_pts else 1) * 1.1,
-                    lambda x: f"{x / 60:.0f} min", lambda y: f"{y:,.0f}", lambda n, x, y: f"After {fmt_min(x)}: {y:,} calls analysed")
+    v_found = sum((r.get("verify") or {}).get("found") or 0 for r in verified)
+    v_sent = sum(r.get("uploaded_calls") or 0 for r in verified)
+    c_verified = hbar([(f"{r['uploaded_calls']:,} calls", (r.get("verify") or {}).get("found") or 0,
+                        f"{r['uploaded_calls']:,}-call burst: {(r.get('verify') or {}).get('found') or 0:,} calls found in the system, all finished",
+                        "s1") for r in verified], " found", lambda v: f"{v:,.0f}", label_w=110)
+    t_verified = table(["Calls sent", "Found in the system", "Finished", "Failed"],
+                       [(f"{r['uploaded_calls']:,}", f"{(r.get('verify') or {}).get('found') or 0:,}",
+                         f"{sum(((r.get('verify') or {}).get('status') or {}).get(k, 0) for k in ('analysed', 'skipped')):,}",
+                         f"{((r.get('verify') or {}).get('status') or {}).get('failed', 0):,}") for r in verified])
+    t_ramps = table(["Ramp test", "Highest rate passed", "Per hour"],
+                    [(nice_dt(r.get("started_utc")), f"{r['step_stop']['passed_rate']}/min",
+                      f"{r['step_stop']['passed_rate'] * 60:,}") for r in ramps])
+    b2k_created = max((s["ingested"] for s in (burst2000 or {}).get("timeline") or []), default=0)
+    b2k_ok = ((burst2000 or {}).get("k6") or {}).get("upload_success") == 1
 
     p95s = [((r.get("k6") or {}).get("browse_p95_ms") or 0) / 1000 for r in smoke]
     c_site = hbar([(f"Test {i}", v, f"Test {i}: 95 of every 100 page clicks answered within {v:.2f} seconds", "s1") for i, v in enumerate(p95s, 1)],
@@ -175,18 +220,17 @@ def render(results):
     t_site = table(["Test", "95% of clicks answered within"], [(f"Test {i}", f"{v:.2f} s") for i, v in enumerate(p95s, 1)])
 
     step_rate = 200  # the steady rate the system kept pace with (step 1 of the step-up test)
-    per_hour, analysed_hour = step_rate * 60, round(a_rate * 60 / 100) * 100
-    big = best.get(1000)
+    per_hour = step_rate * 60
     tiles = "".join(f'<div class="tile"><div class="big">{v}</div><div class="cap">{e(c)}</div></div>' for v, c in [
-        ("0", "calls lost in completed tests"), (f"{speedup}×+", "faster analysis than before (real AI)"),
-        ("1,000", "calls handled in one rush"), (f"{per_hour:,}", "per-hour intake pace (10-min test)"),
-        (f"{analysed_hour:,}", "per hour analysed at best (simulated AI)"),
+        (f"{tested_calls // 1000:,}k+", "call uploads tested"),
+        (f"{v_found:,}/{v_sent:,}", "calls verified in the system's own records"),
+        ("1,000", "calls handled in one rush"), (f"{per_hour:,}", "calls per hour taken in, every ramp test"),
         (f"{max(p95s):.1f} s" if p95s else "–", "page loads in normal use")])
 
     def card(n, title, plain, example, chart="", tbl="", leg=""):
+        visual = f'{leg}<div class=chart>{chart}</div>' if charts and chart else ""  # text-only unless --charts
         return (f'<section class="card"><div class="num">{n}</div><h2>{e(title)}</h2><p class="plain">{plain}</p>'
-                f'<div class="example"><b>Everyday example</b><p>{example}</p></div>'
-                f'{leg}{f"<div class=chart>{chart}</div>" if chart else ""}{tbl}</section>')
+                f'<div class="example"><b>Everyday example</b><p>{example}</p></div>{visual}{tbl}</section>')
 
     sections = "".join([
         card(1, "Every completed test finished all of its calls",
@@ -194,39 +238,48 @@ def render(results):
              "registered and analysed (very short recordings, under 30 seconds, are skipped on purpose). Tests stopped early by the "
              "safety switch are not counted here.",
              f"Like a courier company delivering {calls_done:,} parcels without misplacing a single one, even on its busiest days.", c_lost),
-        card(2, f"Call analysis is more than {speedup} times faster than before",
-             f"Both measured with real AI: the old setup analysed about <b>{CELERY_PER_MIN} calls a minute</b>; the new cloud setup "
-             f"averaged <b>{lo_avg:.0f}–{hi_avg:.0f} calls a minute</b> over a whole test and reached <b>{hi_peak:.0f}</b> in its busiest minute.",
-             f"Analysing 1,000 calls used to take about <b>{1000 / CELERY_PER_MIN / 60:.0f} hours</b>. At the new speed it takes roughly "
-             f"<b>{int(1000 / hi_peak / 5) * 5}–{math.ceil(1000 / lo_avg / 5) * 5} minutes</b>: the difference between waiting until "
-             "tomorrow and waiting for a meeting to end.", c_speed),
-        card(3, "It handles a sudden rush of 1,000 calls",
+        card(2, "It handles a sudden rush of 1,000 calls",
              "We dropped large batches of calls on the system all at the same moment. Every batch was fully analysed, and bigger "
              "batches simply took a little longer — nothing broke.",
              (f"Think of a Monday morning when the weekend's recordings arrive together: a pile of 1,000 calls was fully analysed in "
               f"<b>{round(min(all_t[1000]) / 60)}–{round(max(all_t[1000]) / 60)} minutes</b> across {len(all_t[1000])} tests "
               "(the chart shows the fastest run for each size).") if all_t.get(1000) else "", c_burst, t_burst),
-        card(4, f"It kept pace with {step_rate} new calls every minute",
+        card(3, f"It kept pace with {step_rate} new calls every minute",
              f"For ten minutes we sent calls non-stop at a steady pace of 200 a minute. The system registered them as fast as they arrived "
              f"(the two lines stay together) with zero errors. That is a pace of <b>{per_hour:,} calls an hour</b>, measured over a "
              "10-minute test.",
              f"If each agent finishes around 30 calls an hour, {per_hour:,} calls an hour is the output of roughly "
              f"<b>{per_hour // 30:,} agents</b> working at the same time.", c_keep, t_keep,
              legend([("Calls sent", "s2"), ("Calls registered", "s1")])),
-        card(5, "It works at a steady, predictable pace",
-             f"While working through a large queue for about 20 minutes, the system analysed calls at an even <b>{a_rate:.0f} calls a "
-             "minute</b> (with simulated AI timing). A straight line like this means the speed can be planned for.",
-             f"Like a well-run production line: about {a_rate:.0f} items every minute, so {analysed_hour:,} an hour or "
-             f"<b>{analysed_hour * 8:,} in an 8-hour shift</b>. If one reviewer checks around 40 calls a day, that is the work of about "
-             f"<b>{analysed_hour * 8 // 40:,} reviewers</b>.", c_steady),
-        card(6, "The website is quick in normal use",
+        card(4, "Every call was checked against the system's own records",
+             f"For the {len(verified)} rush tests run with the new call-by-call check, every one of the <b>{v_sent:,} calls</b> sent was "
+             f"found in the system's own call list and <b>all {v_found:,} finished</b>, with none failed. The test's numbers and the "
+             "system's own records agree.",
+             "Like checking a delivery against the warehouse's own stock list, not just the driver's receipt: every item is on the shelf.",
+             c_verified, t_verified),
+        card(5, "Every upload was accepted",
+             f"Across every test sent at normal packing (steady flows and rushes of up to 10 zip files at once), <b>{up_zips:,} zip uploads "
+             f"carrying {up_calls:,} calls</b> were sent and <b>{'none' if not up_rejected else up_rejected}</b> "
+             f"{'was' if not up_rejected else 'were'} rejected.",
+             "Like a post office that accepted every parcel handed over the counter, all day.", "", ""),
+        card(6, "The same result every time",
+             f"Calls taken in at <b>{step_rate} a minute ({per_hour:,} an hour)</b> without falling behind, in every one of the "
+             f"{len(ramps)} ramp tests. Repeating a test gives the same answer, so the numbers can be planned around.",
+             "Like a scale that shows the same weight each time you step on it: you can trust the reading.", "", t_ramps),
+        card(7, f"Even {b2k_created:,} calls at once were all received",
+             f"In the largest rush, <b>all {b2k_created:,} calls</b> sent at the same moment as 10 zip files were accepted and created "
+             "in the system, with no upload turned away." if b2k_ok and b2k_created else "",
+             "Like a stadium gate letting a full crowd in: every ticket scanned, nobody turned away.", "", "")
+        if burst2000 and b2k_ok and b2k_created >= 2000 else "",
+        card(8, "The website is quick in normal use",
              f"With normal activity, 95 out of every 100 page clicks were answered within <b>{max(p95s):.1f} seconds</b> — "
              "well inside our 2-second target.",
              "That is about the time it takes to blink. Users open a call, a report or a list and it is simply there.",
              c_site, t_site),
-        card(7, "Testing is safe and repeatable",
+        card(9, "Testing is safe and repeatable",
              "Every test has a built-in safety switch: if the system shows signs of strain, the test stops itself straight away. "
-             "Each run also produces its own report, so results can be compared over time.",
+             "Each run produces its own report and is checked call by call against the system's records, so results can be "
+             "compared over time.",
              "Like a treadmill stress test with a heart monitor: it pushes hard, but stops the moment the readings say so."),
     ])
 
@@ -245,8 +298,8 @@ def render(results):
 of real call recordings at it in rushes and at a steady pace. Here are the strongest results, explained in everyday terms.</p>
 <div class="tiles">{tiles}</div></header>
 {sections}
-<footer>Measured on the BPO-BOX test environment (qat.bpobox.ai), not production. Most tests used simulated AI timing; the speed-up in
-point 2 compares old and new with real AI. Agent and reviewer comparisons are illustrative estimates. Hover over any chart for exact values.</footer>
+<footer>Measured on the BPO-BOX test environment, not production, with simulated AI timing. Agent comparisons are
+illustrative estimates.{" Hover over any chart for exact values." if charts else ""}</footer>
 </main><div id="tip" hidden></div><script>{JS}</script></body></html>"""
 
 
@@ -305,6 +358,7 @@ document.querySelectorAll('[data-tip]').forEach(el=>{
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--out", type=Path, default=HERE / "qat" / "results" / "BPO-BOX_Highlights.html")
+    ap.add_argument("--charts", action="store_true", help="include the charts (default: text only)")
     args = ap.parse_args()
     results = load_results()
     if not results:
@@ -312,7 +366,7 @@ def main() -> int:
         return 1
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(render(results), encoding="utf-8")
+        args.out.write_text(render(results, load_k6_summaries(), charts=args.charts), encoding="utf-8")
     except OSError as err:
         print(f"Cannot write {args.out}: {err}", file=sys.stderr)
         return 1

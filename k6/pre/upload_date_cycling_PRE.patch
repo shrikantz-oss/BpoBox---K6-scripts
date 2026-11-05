@@ -1,0 +1,79 @@
+--- a/app/core/config.py
++++ b/app/core/config.py
+@@ -273,6 +273,9 @@
+     )
+     DIALPAD_BASE_URL_V2: str = os.getenv("DIALPAD_BASE_URL_V2", "https://dialpad.com/api/v2")
+     PIPELINE: str = os.getenv("DIALPAD_PIPELINE", "celery").strip().lower()
++    # Uploaded calls are back-dated over the last 60 days by their position in the zip (demo history).
++    # false = every uploaded call is dated at upload time (load tests, real imports).
++    UPLOAD_DATE_CYCLING: bool = os.getenv("UPLOAD_DATE_CYCLING", "true").strip().lower() == "true"
+     TELECMI_BASE_URL: str = os.getenv("TELECMI_BASE_URL", "https://rest.telecmi.com/v2")
+     LAMBDA_RECORDINGS_BUCKET: str = os.getenv("LAMBDA_RECORDINGS_BUCKET", "")
+     DIALPAD_WEBHOOK_SQS_QUEUE_URL: str = os.getenv("DIALPAD_WEBHOOK_SQS_QUEUE_URL", "")
+--- a/app/api/calls_upload_script/service.py
++++ b/app/api/calls_upload_script/service.py
+@@ -74,8 +74,12 @@
+     """
+     Returns a created_at date within the last 60 days from today.
+     Cycles every 60 records.
++
++    UPLOAD_DATE_CYCLING=false dates every call at upload time instead (load tests, real imports).
+     """
+     today = datetime.now(timezone.utc)
++    if not settings.UPLOAD_DATE_CYCLING:
++        return today
+     day_offset = index % 60
+     return today - timedelta(days=day_offset)
+ 
+--- /dev/null
++++ b/tests/unit/test_calls_upload_date_cycling.py
+@@ -0,0 +1,49 @@
++"""UPLOAD_DATE_CYCLING controls the created_at of uploaded calls.
++
++true (default): back-dated by position in the zip, today - (index % 60) days, as before.
++false: every call is dated at upload time, so a load test's calls all land on one day.
++
++Runs the real helper from service.py without importing the app (no DB, broker or secrets needed).
++"""
++from __future__ import annotations
++
++import ast
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++SERVICE = ROOT / "app" / "api" / "calls_upload_script" / "service.py"
++CONFIG = ROOT / "app" / "core" / "config.py"
++
++
++def _helper(cycling: bool):
++    """get_cycled_created_at compiled from service.py, with settings.UPLOAD_DATE_CYCLING stubbed."""
++    tree = ast.parse(SERVICE.read_text(encoding="utf-8"))
++    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "get_cycled_created_at")
++    ns = {"datetime": datetime, "timezone": timezone, "timedelta": timedelta,
++          "settings": SimpleNamespace(UPLOAD_DATE_CYCLING=cycling)}
++    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(SERVICE), "exec"), ns)  # noqa: S102 - our own source
++    return ns["get_cycled_created_at"]
++
++
++@pytest.mark.parametrize("index", [0, 1, 9, 59, 60, 4999])
++def test_cycling_off_dates_every_call_now(index):
++    before = datetime.now(timezone.utc)
++    got = _helper(cycling=False)(index)
++    assert before <= got <= datetime.now(timezone.utc)
++
++
++@pytest.mark.parametrize("index, days", [(0, 0), (1, 1), (9, 9), (59, 59), (60, 0), (61, 1)])
++def test_cycling_on_keeps_the_60_day_spread(index, days):
++    got = _helper(cycling=True)(index)
++    expected = datetime.now(timezone.utc) - timedelta(days=days)
++    assert abs(got - expected) < timedelta(seconds=5)
++
++
++def test_setting_defaults_to_cycling_on():
++    """Existing environments keep today's behaviour unless UPLOAD_DATE_CYCLING=false is set."""
++    src = CONFIG.read_text(encoding="utf-8")
++    assert 'os.getenv("UPLOAD_DATE_CYCLING", "true")' in src
